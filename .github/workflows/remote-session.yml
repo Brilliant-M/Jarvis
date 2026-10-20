@@ -1,0 +1,258 @@
+name: remote-session
+
+on:
+  workflow_dispatch:
+    inputs:
+      worker_id:
+        description: "Tailscale hostname for this worker"
+        required: false
+        default: "runner"
+      restore_source:
+        description: "all | backup-a | backup-b | none"
+        required: false
+        default: "all"
+      ts_tag:
+        description: "Tailscale ACL tag (must exist in your tailnet ACL)"
+        required: false
+        default: "tag:ci"
+  schedule:
+    - cron: '0 */6 * * *'
+
+concurrency:
+  group: remote-session
+  cancel-in-progress: false
+
+env:
+  WORKER_ID:       ${{ inputs.worker_id       || 'runner' }}
+  RESTORE_SOURCE:  ${{ inputs.restore_source  || 'all' }}
+  TS_TAG:          ${{ inputs.ts_tag          || 'tag:ci' }}
+  BACKUP_REPO:     ${{ secrets.BACKUP_REPO }}
+  BACKUP_BRANCH_A: "backup-a"
+  BACKUP_BRANCH_B: "backup-b"
+  SESSION_SECONDS: "19800"
+
+jobs:
+  remote:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---------------------------------------------------------------
+      # 1) RESTORE $HOME from encrypted backup
+      # ---------------------------------------------------------------
+      - name: Restore $HOME from encrypted backup
+        env:
+          BACKUP_PAT:        ${{ secrets.BACKUP_PAT }}
+          BACKUP_PASSPHRASE: ${{ secrets.ENCRYPTION_PASS }}
+        run: |
+          set -euo pipefail
+          case "${RESTORE_SOURCE}" in
+            all)      BRANCHES=("${BACKUP_BRANCH_A}" "${BACKUP_BRANCH_B}") ;;
+            backup-a) BRANCHES=("${BACKUP_BRANCH_A}") ;;
+            backup-b) BRANCHES=("${BACKUP_BRANCH_B}") ;;
+            none)     echo "restore_source=none — skipping"; exit 0 ;;
+            *)        echo "unknown restore_source='${RESTORE_SOURCE}', defaulting to all"
+                      BRANCHES=("${BACKUP_BRANCH_A}" "${BACKUP_BRANCH_B}") ;;
+          esac
+
+          if [ -z "${BACKUP_PASSPHRASE:-}" ] || [ -z "${BACKUP_REPO:-}" ]; then
+            echo "passphrase or repo missing — starting fresh"; exit 0
+          fi
+
+          PASSFILE=$(mktemp); chmod 600 "$PASSFILE"
+          printf '%s' "$BACKUP_PASSPHRASE" > "$PASSFILE"
+          trap 'rm -f "$PASSFILE" /tmp/restore.gpg /tmp/restore.tar.gz; rm -rf /tmp/backup-repo' EXIT
+
+          for BRANCH in "${BRANCHES[@]}"; do
+            echo "== trying ${BRANCH} =="
+            rm -rf /tmp/backup-repo
+            if ! git clone -q --depth 1 --branch "$BRANCH" \
+                  "https://x-access-token:${BACKUP_PAT}@github.com/${BACKUP_REPO}.git" \
+                  /tmp/backup-repo 2>/dev/null; then
+              echo "  branch ${BRANCH} unavailable — trying next"; continue
+            fi
+            shopt -s nullglob
+            CHUNKS=(/tmp/backup-repo/home-backup.tar.gz.gpg.*)
+            if [ ${#CHUNKS[@]} -eq 0 ] && [ -f /tmp/backup-repo/home-backup.tar.gz.gpg ]; then
+              CHUNKS=(/tmp/backup-repo/home-backup.tar.gz.gpg)
+            fi
+            if [ ${#CHUNKS[@]} -eq 0 ]; then
+              echo "  no files in ${BRANCH} — trying next"; continue
+            fi
+            echo "  found ${#CHUNKS[@]} file(s)"
+            rm -f /tmp/restore.gpg /tmp/restore.tar.gz
+            cat "${CHUNKS[@]}" > /tmp/restore.gpg
+            if ! gpg --batch --yes --decrypt --passphrase-file "$PASSFILE" \
+                  --output /tmp/restore.tar.gz /tmp/restore.gpg 2>/dev/null; then
+              echo "  decrypt failed — trying next"; continue
+            fi
+            if ! tar -tzf /tmp/restore.tar.gz >/dev/null 2>&1; then
+              echo "  tarball bad — trying next"; continue
+            fi
+            tar -xzf /tmp/restore.tar.gz -C "$HOME"
+            echo "== restored \$HOME from ${BRANCH} =="
+            ls -la "$HOME" | head -20
+            exit 0
+          done
+          echo "== no valid backup — starting fresh =="
+
+      # ---------------------------------------------------------------
+      # 2) TAILSCALE + SSH
+      # ---------------------------------------------------------------
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v2
+        with:
+          authkey:  ${{ secrets.TAILSCALE_AUTHKEY }}
+          tags:     ${{ env.TS_TAG }}
+          hostname: ${{ env.WORKER_ID }}
+
+      - name: Enable Tailscale SSH + openssh-server
+        run: |
+          set -e
+          sudo tailscale set --ssh --accept-dns=true
+          sudo apt-get update -y
+          sudo apt-get install -y openssh-server
+          sudo systemctl enable --now ssh
+          echo "Tailscale IP: $(tailscale ip -4 || true)"
+          echo "Tailscale hostname: $(tailscale status --json | jq -r '.Self.DNSName' | sed 's/\.$//')"
+
+      - name: Inject SSH public key (optional)
+        env:
+          SSH_PUBKEY: ${{ secrets.SSH_PUBKEY }}
+        run: |
+          if [ -n "${SSH_PUBKEY:-}" ]; then
+            mkdir -p ~/.ssh; chmod 700 ~/.ssh
+            echo "${SSH_PUBKEY}" >> ~/.ssh/authorized_keys
+            chmod 600 ~/.ssh/authorized_keys
+            echo "SSH key installed for user runner"
+          else
+            echo "No SSH_PUBKEY secret — relying on Tailscale SSH only"
+          fi
+
+      # ---------------------------------------------------------------
+      # 3) RUN CLOUD-INIT (auto-installs/upgrades packages on every boot)
+      # ---------------------------------------------------------------
+      - name: Run cloud_init (if provided)
+        env:
+          CLOUD_INIT_B64: ${{ secrets.CLOUD_INIT_B64 }}
+        run: |
+          if [ -z "${CLOUD_INIT_B64:-}" ]; then
+            echo "No CLOUD_INIT_B64 secret — skipping"
+            exit 0
+          fi
+          echo "${CLOUD_INIT_B64}" | base64 -d > /tmp/cloud_init.sh
+          chmod +x /tmp/cloud_init.sh
+          echo "===== running cloud_init ====="
+          bash /tmp/cloud_init.sh
+          echo "===== cloud_init finished ====="
+
+      # ---------------------------------------------------------------
+      # 4) BACKUP LOOP (2-snapshot rotation, chunked, AES-256)
+      # ---------------------------------------------------------------
+      - name: Start periodic encrypted backup loop
+        env:
+          BACKUP_PAT:        ${{ secrets.BACKUP_PAT }}
+          BACKUP_PASSPHRASE: ${{ secrets.ENCRYPTION_PASS }}
+        run: |
+          set -e
+          cat > /tmp/backup.sh <<'SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          echo "== encrypted backup $(date -u +%FT%TZ) =="
+          [ -z "${BACKUP_PASSPHRASE:-}" ] && { echo "no passphrase"; exit 1; }
+          [ -z "${BACKUP_REPO:-}" ]       && { echo "no repo";       exit 1; }
+
+          ARCHIVE=/tmp/home-backup.tar.gz.gpg
+          CHUNKS=/tmp/home-chunks
+          PASSFILE=$(mktemp); chmod 600 "$PASSFILE"
+          printf '%s' "$BACKUP_PASSPHRASE" > "$PASSFILE"
+          trap 'rm -f "$PASSFILE" "$ARCHIVE"' EXIT
+
+          # NOTE: ~/.local/bin and ~/.local/lib are INCLUDED on purpose.
+          # Toolchains (.rustup, .nvm, .cargo caches) are excluded for size.
+          tar -C "$HOME" \
+            --exclude='./.cache'         --exclude='./.rustup' \
+            --exclude='./.cargo/registry' --exclude='./.cargo/git' \
+            --exclude='./.npm/_cacache'  --exclude='./.nvm' \
+            --exclude='./.nuget'         --exclude='./.gradle' \
+            --exclude='./.m2'            --exclude='./.pub-cache' \
+            --exclude='./.sdkman'        --exclude='./.dotnet' \
+            --exclude='./.stack'         --exclude='./.ghcup' \
+            --exclude='./.opam'          --exclude='./.vscode-server' \
+            --exclude='./.vscode'        --exclude='./.config/Code' \
+            --exclude='./.config/google-chrome' --exclude='./.mozilla' \
+            --exclude='./work'           --exclude='./actions-runner' \
+            --exclude='./.ssh'           --exclude='./.gnupg' \
+            --exclude='./.docker'        --exclude='./.kube' \
+            --exclude='./.config/gh'     --exclude='./.local/share/containers' \
+            --exclude='*.log' \
+            -czf - . \
+            | gpg --batch --yes --symmetric --cipher-algo AES256 \
+                  --passphrase-file "$PASSFILE" --output "$ARCHIVE"
+
+          SIZE_MB=$(du -m "$ARCHIVE" | cut -f1)
+          echo "archive: ${SIZE_MB} MB"
+          [ "$SIZE_MB" -gt 800 ] && { echo ">800 MB — skipping push (tighten excludes)" >&2; exit 1; }
+
+          rm -rf "$CHUNKS"; mkdir -p "$CHUNKS"
+          split -b 50M -d -a 3 "$ARCHIVE" "$CHUNKS/home-backup.tar.gz.gpg."
+
+          REPO=/tmp/backup-repo; rm -rf "$REPO"; mkdir -p "$REPO"; cd "$REPO"
+          git init -q -b main
+          git remote add origin "https://x-access-token:${BACKUP_PAT}@github.com/${BACKUP_REPO}.git"
+          git fetch -q origin '+refs/heads/*:refs/remotes/origin/*' 2>/dev/null || true
+
+          if git rev-parse -q --verify "refs/remotes/origin/${BACKUP_BRANCH_A}" >/dev/null; then
+            A_SHA=$(git rev-parse "refs/remotes/origin/${BACKUP_BRANCH_A}")
+            git push -q --force origin "$A_SHA:refs/heads/${BACKUP_BRANCH_B}"
+            echo "promoted A→B"
+          fi
+
+          cp -r "$CHUNKS"/. .
+          git add -A
+          git -c user.name="backup-bot" -c user.email="backup-bot@users.noreply.github.com" \
+              commit -q -m "encrypted backup: $(date -u +%FT%TZ)"
+          git push -q --force origin "HEAD:refs/heads/${BACKUP_BRANCH_A}"
+          echo "pushed → ${BACKUP_BRANCH_A}"
+
+          for b in $(git ls-remote --heads origin | awk '{print $2}' | sed 's|refs/heads/||'); do
+            case "$b" in "${BACKUP_BRANCH_A}"|"${BACKUP_BRANCH_B}") ;; *)
+              git push -q origin --delete "$b" 2>/dev/null \
+                || echo "  skip delete $b (default branch — set backup-a as default)"
+            ;; esac
+          done
+          SCRIPT
+          chmod +x /tmp/backup.sh
+          ( while true; do bash /tmp/backup.sh || true; sleep 1800; done ) &
+          echo $! > /tmp/backup.pid
+
+      # ---------------------------------------------------------------
+      # 5) KEEP-ALIVE (stoppable via /tmp/stop_worker)
+      # ---------------------------------------------------------------
+      - name: Keep session alive (stoppable)
+        run: |
+          END=$(( $(date +%s) + SESSION_SECONDS ))
+          echo "Alive until: $(date -u -d "@${END}")"
+          while [ "$(date +%s)" -lt "$END" ]; do
+            if [ -f /tmp/stop_worker ]; then
+              echo "stop signal received — ending session"
+              break
+            fi
+            sleep 10
+          done
+
+      # ---------------------------------------------------------------
+      # 6) FINAL BACKUP
+      # ---------------------------------------------------------------
+      - name: Final encrypted backup
+        if: always()
+        env:
+          BACKUP_PAT:        ${{ secrets.BACKUP_PAT }}
+          BACKUP_PASSPHRASE: ${{ secrets.ENCRYPTION_PASS }}
+        run: |
+          kill "$(cat /tmp/backup.pid 2>/dev/null)" 2>/dev/null || true
+          [ -x /tmp/backup.sh ] && bash /tmp/backup.sh || true
